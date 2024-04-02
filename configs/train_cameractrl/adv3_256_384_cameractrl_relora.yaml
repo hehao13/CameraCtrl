@@ -1,0 +1,99 @@
+
+output_dir: "output/cameractrl_model"
+pretrained_model_path: "[replace with SD1.5 root path]"
+unet_subfolder: "unet_webvidlora_v3"
+
+train_data:
+  root_path:       "[replace RealEstate10K root path]"
+  annotation_json:       "annotations/train.json"
+  sample_stride: 8
+  sample_n_frames: 16
+  relative_pose: true
+  zero_t_first_frame: true
+  sample_size: [256, 384]
+  rescale_fxy: true
+  shuffle_frames: true
+  use_flip: true
+
+validation_data:
+  root_path:       "[replace RealEstate10K root path]"
+  annotation_json:       "annotations/validation.json"
+  sample_stride: 8
+  sample_n_frames: 16
+  relative_pose: true
+  zero_t_first_frame: true
+  sample_size: [256, 384]
+  rescale_fxy: true
+  shuffle_frames: false
+  use_flip: false
+  return_clip_name: true
+
+unet_additional_kwargs:
+  use_motion_module              : true
+  motion_module_resolutions      : [ 1,2,4,8 ]
+  unet_use_cross_frame_attention : false
+  unet_use_temporal_attention    : false
+  motion_module_mid_block: false
+  motion_module_type: Vanilla
+  motion_module_kwargs:
+    num_attention_heads                : 8
+    num_transformer_block              : 1
+    attention_block_types              : [ "Temporal_Self", "Temporal_Self" ]
+    temporal_position_encoding         : true
+    temporal_position_encoding_max_len : 32
+    temporal_attention_dim_div         : 1
+    zero_initialize                    : false
+
+lora_rank: 2
+lora_scale: 1.0
+lora_ckpt: "[Replace with RealEstate10k image LoRA ckpt]"
+motion_module_ckpt: "[Replace with ADV3 motion module]"
+
+pose_encoder_kwargs:
+  downscale_factor: 8
+  channels: [320, 640, 1280, 1280]
+  nums_rb: 2
+  cin: 384
+  ksize: 1
+  sk: true
+  use_conv: false
+  compression_factor: 1
+  temporal_attention_nhead: 8
+  attention_block_types: ["Temporal_Self", ]
+  temporal_position_encoding: true
+  temporal_position_encoding_max_len: 16
+attention_processor_kwargs:
+  add_spatial: false
+  spatial_attn_names: 'attn1'
+  add_temporal: true
+  temporal_attn_names: '0'
+  pose_feature_dimensions: [320, 640, 1280, 1280]
+  query_condition: true
+  key_value_condition: true
+  scale: 1.0
+noise_scheduler_kwargs:
+  num_train_timesteps: 1000
+  beta_start:          0.00085
+  beta_end:            0.012
+  beta_schedule:       "linear"
+  steps_offset:        1
+  clip_sample:         false
+
+do_sanity_check: true
+
+max_train_epoch:      -1
+max_train_steps:      25000
+validation_steps:       1000
+validation_steps_tuple: [2, ]
+
+learning_rate:    1.e-4
+
+num_workers: 8
+train_batch_size: 2
+checkpointing_epochs: -1
+checkpointing_steps:  1000
+
+mixed_precision_training: true
+global_seed: 42
+logger_interval: 10
+

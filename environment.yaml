@@ -1,0 +1,27 @@
+name: cameractrl
+channels:
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.10
+  - pytorch=1.13.1
+  - torchvision=0.14.1
+  - torchaudio=0.13.1
+  - pytorch-cuda=11.7
+  - pip
+  - pip:
+    - diffusers==0.24.0
+    - xformers==0.0.16
+    - imageio==2.27.0
+    - imageio[ffmpeg]
+    - opencv-python
+    - transformers
+    - gdown
+    - einops
+    - decord
+    - omegaconf
+    - safetensors
+    - gradio
+    - wandb
+    - triton
+    - termcolor
