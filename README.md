@@ -5,7 +5,7 @@ This repository is the official implementation of [CameraCtrl](https://arxiv.org
 > **CameraCtrl: Enabling Camera Control for Text-to-Video Generation** <br>
 > [Hao He](https://hehao13.github.io), [Yinghao Xu](https://justimyhxu.github.io), [Yuwei Guo](https://guoyww.github.io), [Gordon Wetzstein](https://web.stanford.edu/~gordonwz/), [Bo Dai](http://daibo.info), [Hongsheng Li](https://www.ee.cuhk.edu.hk/~hsli/), [Ceyuan Yang](https://ceyuan.me)<br>
 
-## [[Paper](https://hehao13.github.io/projects-CameraCtrl/)] [[Project Page]( https://hehao13.github.io/projects-CameraCtrl/)] [[Weights](https://huggingface.co/hehao13/CameraCtrl/tree/main)]
+## [[Paper](http://arxiv.org/abs/2404.02101)] [[Project Page]( https://hehao13.github.io/projects-CameraCtrl/)] [[Weights](https://huggingface.co/hehao13/CameraCtrl/tree/main)]
 
 ## Todo List
 - [x] Release inference code.
@@ -224,3 +224,13 @@ We thank [AnimateDiff](https://github.com/guoyww/AnimateDiff) for their amazing 
 
 ## BibTeX
 
+```bibtex
+@misc{he2024cameractrl,
+      title={CameraCtrl: Enabling Camera Control for Text-to-Video Generation}, 
+      author={Hao He and Yinghao Xu and Yuwei Guo and Gordon Wetzstein and Bo Dai and Hongsheng Li and Ceyuan Yang},
+      year={2024},
+      eprint={2404.02101},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV}
+}
+```
