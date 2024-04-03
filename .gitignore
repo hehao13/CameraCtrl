@@ -15,9 +15,7 @@ scripts/
 *.safetensors 
 *.ckpt
 .idea
-*.json
 *.csv
-*.txt
 
 outputs/*
 !models/StableDiffusion/
