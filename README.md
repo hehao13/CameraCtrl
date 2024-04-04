@@ -1,6 +1,6 @@
 # CameraCtrl
 
-This repository is the official implementation of [CameraCtrl](https://arxiv.org/abs/).
+This repository is the official implementation of [CameraCtrl](http://arxiv.org/abs/2404.02101).
 
 > **CameraCtrl: Enabling Camera Control for Text-to-Video Generation** <br>
 > [Hao He](https://hehao13.github.io), [Yinghao Xu](https://justimyhxu.github.io), [Yuwei Guo](https://guoyww.github.io), [Gordon Wetzstein](https://web.stanford.edu/~gordonwz/), [Bo Dai](http://daibo.info), [Hongsheng Li](https://www.ee.cuhk.edu.hk/~hsli/), [Ceyuan Yang](https://ceyuan.me)<br>
@@ -57,7 +57,7 @@ conda activate cameractrl
 
 ### Prepare Models
 - Download Stable Diffusion V1.5 (SD1.5) from [HuggingFace](https://huggingface.co/runwayml/stable-diffusion-v1-5/tree/main).
-- Download the checkpoints of AnimatediffV3 (ADV3) adaptor and motion module from [AnimateDiff](https://github.com/guoyww/AnimateDiff).
+- Download the checkpoints of AnimateDiffV3 (ADV3) adaptor and motion module from [AnimateDiff](https://github.com/guoyww/AnimateDiff).
 - Download the pretrained camera control model from [HuggingFace](https://huggingface.co/hehao13/CameraCtrl/blob/main/CameraCtrl.ckpt).
 - Run `tools/merge_lora2unet.py` to merge the ADV3 adaptor weights into SD1.5 unet and save results to new subfolder (like, `unet_webvidlora_v3`) under the SD1.5 folder.
 - (Optional) Download the pretrained image LoRA model on RealEstate10K dataset from [HuggingFace](https://huggingface.co/hehao13/CameraCtrl/blob/main/RealEstate10K_LoRA.ckpt) to sample videos on indoor and outdoor estates.
@@ -219,18 +219,21 @@ or PyTorch
 ./dist_run.sh configs/train_cameractrl/adv3_256_384_cameractrl_relora.yaml 8 train_camera_control.py
 ```
 
+## Disclaimer
+This project is released for academic use. We disclaim responsibility for user-generated content. Users are solely liable for their actions. The project contributors are not legally affiliated with, nor accountable for, users' behaviors. Use the generative model responsibly, adhering to ethical and legal standards. 
+
+
 ## Acknowledgement
 We thank [AnimateDiff](https://github.com/guoyww/AnimateDiff) for their amazing codes and models.
+
 
 ## BibTeX
 
 ```bibtex
-@misc{he2024cameractrl,
+@article{he2024cameractrl,
       title={CameraCtrl: Enabling Camera Control for Text-to-Video Generation}, 
       author={Hao He and Yinghao Xu and Yuwei Guo and Gordon Wetzstein and Bo Dai and Hongsheng Li and Ceyuan Yang},
-      year={2024},
-      eprint={2404.02101},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV}
+      journal={arXiv preprint arXiv:2404.02101},
+      year={2024}
 }
 ```
