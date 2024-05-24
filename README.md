@@ -2,17 +2,19 @@
 
 This repository is the official implementation of [CameraCtrl](http://arxiv.org/abs/2404.02101).
 
-> **CameraCtrl: Enabling Camera Control for Text-to-Video Generation** <br>
+This `main` branch contains the codes and model for CameraCtrl implemented on AnimateDiffV3. For codes and models of CameraCtrl with stable video diffusion, please refer to the `svd` branch for detail. 
+
+> **CameraCtrl: Enabling Camera Control for Video Diffusion Models** <br>
 > [Hao He](https://hehao13.github.io), [Yinghao Xu](https://justimyhxu.github.io), [Yuwei Guo](https://guoyww.github.io), [Gordon Wetzstein](https://web.stanford.edu/~gordonwz/), [Bo Dai](http://daibo.info), [Hongsheng Li](https://www.ee.cuhk.edu.hk/~hsli/), [Ceyuan Yang](https://ceyuan.me)<br>
 
-## [[Paper](http://arxiv.org/abs/2404.02101)] [[Project Page]( https://hehao13.github.io/projects-CameraCtrl/)] [[Weights](https://huggingface.co/hehao13/CameraCtrl/tree/main)]
+## [[Paper](http://arxiv.org/abs/2404.02101)] [[Project Page]( https://hehao13.github.io/projects-CameraCtrl/)] [[Weights](https://huggingface.co/hehao13/CameraCtrl/tree/main)] [[HF Demo](https://huggingface.co/spaces/hehao13/CameraCtrl-svd-xt)]
 
 ## Todo List
 - [x] Release inference code.
 - [x] Release pretrained models on [AnimateDiffV3](https://github.com/guoyww/AnimateDiff).
 - [x] Release training code.
-- [ ] Release Gradio Demo.
-- [ ] Release pretrained models on SVD.
+- [x] Release Gradio Demo.
+- [x] Release pretrained models on SVD in the `svd` branch.
 
 ## Configurations
 ### Environment
