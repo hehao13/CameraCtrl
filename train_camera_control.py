@@ -1,7 +1,6 @@
 import omegaconf.listconfig
 import os
 import math
-import random
 import time
 import inspect
 import argparse
@@ -11,27 +10,28 @@ import subprocess
 from pathlib import Path
 from omegaconf import OmegaConf
 from typing import Dict, Tuple
+from datetime import timedelta
 
 import torch
-import torch.nn.functional as F
+import torchvision
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from diffusers import AutoencoderKL, DDIMScheduler
+from einops import rearrange
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
-from diffusers.models.attention_processor import AttnProcessor
-
-from transformers import CLIPTextModel, CLIPTokenizer
-from einops import rearrange
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion import _resize_with_antialiasing
 
 from cameractrl.data.dataset import RealEstate10KPose
 from cameractrl.utils.util import setup_logger, format_time, save_videos_grid
-from cameractrl.pipelines.pipeline_animation import CameraCtrlPipeline
-from cameractrl.models.unet import UNet3DConditionModelPoseCond
+from cameractrl.pipelines.pipeline_animation import StableVideoDiffusionPipelinePoseCond
+from cameractrl.models.unet import UNetSpatioTemporalConditionModelPoseCond
 from cameractrl.models.pose_adaptor import CameraPoseEncoder, PoseAdaptor
-from cameractrl.models.attention_processor import AttnProcessor as CustomizedAttnProcessor
+from cameractrl.models.attention_processor import PoseAdaptorAttnProcessor
 
 
 def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
@@ -41,7 +41,7 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
         num_gpus = torch.cuda.device_count()
         local_rank = rank % num_gpus
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=backend, **kwargs)
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=30), **kwargs)
 
     elif launcher == 'slurm':
         proc_id = int(os.environ['SLURM_PROCID'])
@@ -57,10 +57,12 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
         os.environ['RANK'] = str(proc_id)
         port = os.environ.get('PORT', port)
         os.environ['MASTER_PORT'] = str(port)
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=30))
 
     else:
         raise NotImplementedError(f'Not implemented launcher type: `{launcher}`!')
+    # https://github.com/pytorch/pytorch/issues/98763
+    # torch.cuda.set_device(local_rank)
 
     return local_rank
 
@@ -71,27 +73,20 @@ def main(name: str,
 
          output_dir: str,
          pretrained_model_path: str,
+         unet_subfolder: str,
+         down_block_types: Tuple[str],
+         up_block_types: Tuple[str],
 
          train_data: Dict,
          validation_data: Dict,
-         cfg_random_null_text: bool = True,
-         cfg_random_null_text_ratio: float = 0.1,
-
-         unet_additional_kwargs: Dict = {},
-         unet_subfolder: str = "unet",
-
-         lora_rank: int = 4,
-         lora_scale: float = 1.0,
-         lora_ckpt: str = None,
-         motion_module_ckpt: str = "",
-         motion_lora_rank: int = 0,
-         motion_lora_scale: float = 1.0,
+         random_null_image_ratio: float = 0.15,
 
          pose_encoder_kwargs: Dict = None,
          attention_processor_kwargs: Dict = None,
-         noise_scheduler_kwargs: Dict = None,
 
          do_sanity_check: bool = True,
+         sample_before_training: bool = False,
+         video_length: int = 14,
 
          max_train_epoch: int = -1,
          max_train_steps: int = 100,
@@ -101,6 +96,20 @@ def main(name: str,
          learning_rate: float = 3e-5,
          lr_warmup_steps: int = 0,
          lr_scheduler: str = "constant",
+
+         P_mean: float = 0.7,
+         P_std: float = 1.6,
+         condition_image_noise_mean: float = -3,
+         condition_image_noise_std: float = 1.6,
+         sample_latent: bool = True,
+         first_image_cond: bool = True,
+
+         fps: int = 7,
+         motion_bucket_id: int = 127,
+
+         num_inference_steps: int = 25,
+         min_guidance_scale: float = 1.0,
+         max_guidance_scale: float = 3.0,
 
          num_workers: int = 32,
          train_batch_size: int = 1,
@@ -114,6 +123,7 @@ def main(name: str,
          checkpointing_steps: int = -1,
 
          mixed_precision_training: bool = True,
+         enable_xformers_memory_efficient_attention: bool = True,
 
          global_seed: int = 42,
          logger_interval: int = 10,
@@ -147,80 +157,49 @@ def main(name: str,
         OmegaConf.save(config, os.path.join(output_dir, 'config.yaml'))
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(pretrained_model_path, subfolder="image_encoder")
+    vae = AutoencoderKLTemporalDecoder.from_pretrained(pretrained_model_path, subfolder="vae")
+    unet = UNetSpatioTemporalConditionModelPoseCond.from_pretrained(pretrained_model_path,
+                                                                    subfolder=unet_subfolder,
+                                                                    down_block_types=down_block_types,
+                                                                    up_block_types=up_block_types)
+    noise_scheduler = EulerDiscreteScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
+    feature_extractor = CLIPImageProcessor.from_pretrained(pretrained_model_path, subfolder="feature_extractor")
 
-    vae = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
-    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
-    unet = UNet3DConditionModelPoseCond.from_pretrained_2d(pretrained_model_path, subfolder=unet_subfolder,
-                                                           unet_additional_kwargs=unet_additional_kwargs)
     pose_encoder = CameraPoseEncoder(**pose_encoder_kwargs)
 
     # init attention processor
     logger.info(f"Setting the attention processors")
-    unet.set_all_attn_processor(add_spatial_lora=lora_ckpt is not None,
-                                add_motion_lora=motion_lora_rank > 0,
-                                lora_kwargs={"lora_rank": lora_rank, "lora_scale": lora_scale},
-                                motion_lora_kwargs={"lora_rank": motion_lora_rank, "lora_scale": motion_lora_scale},
-                                **attention_processor_kwargs)
-
-    if lora_ckpt is not None:
-        logger.info(f"Loading the image lora checkpoint from {lora_ckpt}")
-        lora_checkpoints = torch.load(lora_ckpt, map_location=unet.device)
-        if 'lora_state_dict' in lora_checkpoints.keys():
-            lora_checkpoints = lora_checkpoints['lora_state_dict']
-        _, lora_u = unet.load_state_dict(lora_checkpoints, strict=False)
-        assert len(lora_u) == 0
-        logger.info(f'Loading done')
-    else:
-        logger.info(f'We do not add image lora')
-
-    if motion_module_ckpt != "":
-        logger.info(f"Loading the motion module checkpoint from {motion_module_ckpt}")
-        mm_checkpoints = torch.load(motion_module_ckpt, map_location=unet.device)
-        if 'motion_module_state_dict' in mm_checkpoints:
-            mm_checkpoints = {k.replace('module.', ''): v for k, v in mm_checkpoints['motion_module_state_dict'].items()}
-        _, mm_u = unet.load_state_dict(mm_checkpoints, strict=False)
-        assert len(mm_u) == 0
-        logger.info("Loading done")
-    else:
-        logger.info(f"We do not load pretrained motion module checkpoint")
+    unet.set_pose_cond_attn_processor(enable_xformers=(enable_xformers_memory_efficient_attention and is_xformers_available()), **attention_processor_kwargs)
 
     # Freeze vae, and text_encoder
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    image_encoder.requires_grad_(False)
     unet.requires_grad_(False)
 
-    spatial_attn_proc_modules = torch.nn.ModuleList([v for v in unet.attn_processors.values()
-                                                     if not isinstance(v, (CustomizedAttnProcessor, AttnProcessor))])
-    temporal_attn_proc_modules = torch.nn.ModuleList([v for v in unet.mm_attn_processors.values()
-                                                      if not isinstance(v, (CustomizedAttnProcessor, AttnProcessor))])
-    spatial_attn_proc_modules.requires_grad_(True)
-    temporal_attn_proc_modules.requires_grad_(True)
+    pose_cond_attn_proc = torch.nn.ModuleList([v for v in unet.attn_processors.values() if
+                                               isinstance(v, PoseAdaptorAttnProcessor)])
+    pose_cond_attn_proc.requires_grad_(True)
     pose_encoder.requires_grad_(True)
-    # set requires_grad of image lora to False
-    for n, p in spatial_attn_proc_modules.named_parameters():
-        if 'lora' in n:
-            p.requires_grad = False
-            logger.info(f'Setting the `requires_grad` of parameter {n} to false')
+
     pose_adaptor = PoseAdaptor(unet, pose_encoder)
 
     encoder_trainable_params = list(filter(lambda p: p.requires_grad, pose_encoder.parameters()))
     encoder_trainable_param_names = [p[0] for p in
                                      filter(lambda p: p[1].requires_grad, pose_encoder.named_parameters())]
-    attention_trainable_params = [v for k, v in unet.named_parameters() if v.requires_grad and 'merge' in k and 'lora' not in k]
-    attention_trainable_param_names = [k for k, v in unet.named_parameters() if v.requires_grad and 'merge' in k and 'lora' not in k]
+    unet_trainable_params = [v for k, v in unet.named_parameters() if v.requires_grad and 'merge' in k and 'lora' not in k]
+    unet_trainable_param_names = [k for k, v in unet.named_parameters() if v.requires_grad and 'merge' in k and 'lora' not in k]
 
-    trainable_params = encoder_trainable_params + attention_trainable_params
-    trainable_param_names = encoder_trainable_param_names + attention_trainable_param_names
+    trainable_params = encoder_trainable_params + unet_trainable_params
+    trainable_param_names = encoder_trainable_param_names + unet_trainable_param_names
 
     if is_main_process:
         logger.info(f"trainable parameter number: {len(trainable_params)}")
         logger.info(f"encoder trainable number: {len(encoder_trainable_params)}")
-        logger.info(f"attention processor trainable number: {len(attention_trainable_params)}")
+        logger.info(f"attention processor trainable number: {len(unet_trainable_params)}")
         logger.info(f"trainable parameter names: {trainable_param_names}")
         logger.info(f"encoder trainable scale: {sum(p.numel() for p in encoder_trainable_params) / 1e6:.3f} M")
-        logger.info(f"attention processor trainable scale: {sum(p.numel() for p in attention_trainable_params) / 1e6:.3f} M")
+        logger.info(f"attention processor trainable scale: {sum(p.numel() for p in unet_trainable_params) / 1e6:.3f} M")
         logger.info(f"trainable parameter scale: {sum(p.numel() for p in trainable_params) / 1e6:.3f} M")
 
     optimizer = torch.optim.AdamW(
@@ -232,7 +211,7 @@ def main(name: str,
     )
     # Move models to GPU
     vae.to(local_rank)
-    text_encoder.to(local_rank)
+    image_encoder.to(local_rank)
 
     # Get the training dataset
     logger.info(f'Building training datasets')
@@ -286,14 +265,14 @@ def main(name: str,
     )
 
     # Validation pipeline
-    validation_pipeline = CameraCtrlPipeline(
+    validation_pipeline = StableVideoDiffusionPipelinePoseCond(
         vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
+        image_encoder=image_encoder,
         unet=unet,
         scheduler=noise_scheduler,
+        feature_extractor=feature_extractor,
         pose_encoder=pose_encoder)
-    validation_pipeline.enable_vae_slicing()
+    # validation_pipeline.enable_model_cpu_offload()
 
     # DDP wrapper
     pose_adaptor.to(local_rank)
@@ -328,8 +307,6 @@ def main(name: str,
         pose_encoder_state_dict = ckpt['pose_encoder_state_dict']
         attention_processor_state_dict = ckpt['attention_processor_state_dict']
         pose_enc_m, pose_enc_u = pose_adaptor.module.pose_encoder.load_state_dict(pose_encoder_state_dict, strict=False)
-        import pdb
-        pdb.set_trace()
         assert len(pose_enc_m) == 0 and len(pose_enc_u) == 0
         _, attention_processor_u = pose_adaptor.module.unet.load_state_dict(attention_processor_state_dict, strict=False)
         assert len(attention_processor_u) == 0
@@ -342,6 +319,56 @@ def main(name: str,
     # Support mixed-precision training
     scaler = torch.cuda.amp.GradScaler() if mixed_precision_training else None
 
+    if is_main_process and do_sanity_check and sample_before_training:
+
+        generator = torch.Generator(device=unet.device)
+        generator.manual_seed(global_seed)
+
+        if isinstance(train_data, omegaconf.listconfig.ListConfig):
+            height = train_data[0].sample_size[0] if not isinstance(train_data[0].sample_size, int) else \
+                train_data[0].sample_size
+            width = train_data[0].sample_size[1] if not isinstance(train_data[0].sample_size, int) else \
+                train_data[0].sample_size
+        else:
+            height = train_data.sample_size[0] if not isinstance(train_data.sample_size,
+                                                                 int) else train_data.sample_size
+            width = train_data.sample_size[1] if not isinstance(train_data.sample_size,
+                                                                int) else train_data.sample_size
+
+        validation_data_iter = iter(validation_dataloader)
+
+        for idx, validation_batch in enumerate(validation_data_iter):
+            plucker_embedding = validation_batch['plucker_embedding'].to(device=unet.device)
+            if first_image_cond:
+                conditioning_images = validation_batch['pixel_values'][:, 0].to(local_rank)
+            else:
+                conditioning_images = validation_batch['condition_image'][:, 0].to(local_rank)  # [b, c, h, w] -1 - 1
+            sample = validation_pipeline(
+                image=conditioning_images,
+                pose_embedding=plucker_embedding,
+                height=height,
+                width=width,
+                num_frames=video_length,
+                num_inference_steps=num_inference_steps,
+                min_guidance_scale=min_guidance_scale,
+                max_guidance_scale=max_guidance_scale,
+                generator=generator,
+                output_type='pt'
+            ).frames[0].cpu()  # [f 3 h w] 0-1
+            sample_gt = rearrange(torch.cat([sample, (validation_batch['pixel_values'][0] + 1) / 2], dim=2),
+                                  'f c h w -> c f h w')  # [3, f 2h, w]
+            if 'clip_name' in validation_batch:
+                save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}_{validation_batch['clip_name'][0]}.gif"
+                image_save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}_{validation_batch['clip_name'][0]}.png"
+            else:
+                save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}.gif"
+                image_save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}.png"
+            save_videos_grid(sample_gt[None, ...], save_path, rescale=False)
+            conditioning_image = conditioning_images[0] / 2. + 0.5  # 3 h w
+            torchvision.utils.save_image(conditioning_image, image_save_path)
+            logger.info(f"Saved samples to {save_path}")
+    dist.barrier()
+
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
         pose_adaptor.train()
@@ -352,69 +379,104 @@ def main(name: str,
             iter_start_time = time.time()
             batch = next(data_iter)
             data_end_time = time.time()
-            if cfg_random_null_text:
-                batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
 
             # Data batch sanity check
             if epoch == first_epoch and step == 0 and do_sanity_check:
-                pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
+                pixel_values, condition_images, video_captions = batch['pixel_values'].cpu(), batch['condition_image'], batch['video_caption']
                 pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
-                for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                condition_images = rearrange(condition_images, "b f c h w -> b c f h w")
+                for idx, (pixel_value, condition_image, video_caption) in enumerate(zip(pixel_values, condition_images, video_captions)):
                     pixel_value = pixel_value[None, ...]
                     save_videos_grid(pixel_value,
-                                     f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif",
+                                     f"{output_dir}/sanity_check/{'_'.join(video_caption.split(' ')[:10])}.gif",
                                      rescale=True)
+                    condition_image = pixel_value[0, :, 0] if first_image_cond else condition_image[:, 0]  # [3, h, w]
+                    condition_image = condition_image / 2. + 0.5
+                    torchvision.utils.save_image(condition_image,
+                                                 f"{output_dir}/sanity_check/{'_'.join(video_caption.split(' ')[:10])}.png")
 
             ### >>>> Training >>>> ###
 
             # Convert videos to latent space
-            pixel_values = batch["pixel_values"].to(local_rank)
-            video_length = pixel_values.shape[1]
+            pixel_values = batch["pixel_values"].to(local_rank)     # [b, f, c, h, w]
+            bsz, video_length = pixel_values.shape[:2]
             with torch.no_grad():
                 pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
-                latents = vae.encode(pixel_values).latent_dist.sample()
-                latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
-                latents = latents * 0.18215
+                if sample_latent:
+                    latents = vae.encode(pixel_values).latent_dist.sample()
+                else:
+                    latents = vae.encode(pixel_values).latent_dist.mode()
+                latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
+                latents = latents * vae.config.scaling_factor
 
             # Sample noise that we'll add to the latents
-            noise = torch.randn_like(latents)  # [b, c, f, h, w]
-            bsz = latents.shape[0]
+            # 1. get the sigma of each noise
+            rnd_normal = torch.randn([bsz, 1, 1, 1, 1], device=pixel_values.device)
+            sigma = (rnd_normal * P_std + P_mean).exp()
+            # 2. sample the noise
+            noise = torch.randn_like(latents) * sigma
+            # 3. add noise to the latent
+            noisy_latents = latents + noise
 
-            # Sample a random timestep for each video
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-            timesteps = timesteps.long()
+            # Get the preconditioning parameters
+            c_skip = 1 / (sigma ** 2 + 1)
+            c_out = -sigma / (sigma ** 2 + 1) ** 0.5
+            c_in = 1 / (sigma ** 2 + 1) ** 0.5
+            c_noise = (sigma.log() / 4).reshape([bsz])
+            # Get the loss weight
+            loss_weight = (sigma ** 2 + 1) / sigma ** 2     # [bsz, 1, 1, 1, 1]
 
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)  # [b, c, f h, w]
-
-            # Get the text embedding for conditioning
+            # encode conditioning image latent
+            if first_image_cond:
+                conditioning_pixel_value = batch["pixel_values"][:, 0].to(local_rank)    # [b, c, h, w]
+            else:
+                conditioning_pixel_value = batch['condition_image'][:, 0].to(local_rank)     # [b, c, h, w]
+            conditioning_rnd_normal = torch.randn([bsz, 1, 1, 1], device=pixel_values.device)
+            conditioning_sigma = (conditioning_rnd_normal * condition_image_noise_std + condition_image_noise_mean).exp()
+            conditioning_pixel_value = torch.randn_like(conditioning_pixel_value) * conditioning_sigma + conditioning_pixel_value
             with torch.no_grad():
-                prompt_ids = tokenizer(
-                    batch['text'], max_length=tokenizer.model_max_length, padding="max_length", truncation=True,
-                    return_tensors="pt"
-                ).input_ids.to(latents.device)
-                encoder_hidden_states = text_encoder(prompt_ids)[0]  # b l c
+                conditioning_latents = vae.encode(conditioning_pixel_value).latent_dist.mode()
+            conditioning_latents = conditioning_latents.unsqueeze(1).repeat(1, video_length, 1, 1, 1)   # [b f c h w]
+
+            input_latents = torch.cat([c_in * noisy_latents, conditioning_latents], dim=2)      # [b, f, c, h, w]
+
+            # encode image latent using the clip image encoder
+            if first_image_cond:
+                conditioning_images = batch["pixel_values"][:, 0].to(local_rank)    # [b, c, h, w]
+            else:
+                conditioning_images = batch['condition_image'][:, 0].to(local_rank)     # [b, c, h, w]
+            conditioning_images = _resize_with_antialiasing(conditioning_images, (224, 224))
+            conditioning_images = (conditioning_images + 1.0) / 2.0
+            conditioning_images = feature_extractor(images=conditioning_images,
+                                                    do_normalize=True,
+                                                    do_center_crop=False,
+                                                    do_resize=False,
+                                                    do_rescale=False,
+                                                    return_tensors="pt").pixel_values.to(local_rank)
+            encoder_hidden_states = image_encoder(conditioning_images).image_embeds.unsqueeze(1)      # [bsz, 1, c]
+            random_p = torch.rand(bsz, device=pixel_values.device)
+            uncond_mask = random_p < random_null_image_ratio
+            uncond_mask = uncond_mask.unsqueeze(-1).unsqueeze(-1)
+            null_conditioning = torch.zeros_like(encoder_hidden_states)
+            encoder_hidden_states = torch.where(uncond_mask, null_conditioning, encoder_hidden_states)
+
+            # get additional time ids
+            noise_aug_strength = conditioning_sigma[:, 0, 0, 0]       # [bsz, ]
+            add_time_ids = [[fps, motion_bucket_id, strength] for strength in noise_aug_strength]
+            add_time_ids = torch.tensor(add_time_ids, device=local_rank)        # [bsz, 3]
 
             # Predict the noise residual and compute loss
             # Mixed-precision training
             plucker_embedding = batch["plucker_embedding"].to(device=local_rank)  # [b, f, 6, h, w]
-            plucker_embedding = rearrange(plucker_embedding, "b f c h w -> b c f h w")  # [b, 6, f h, w]
-            with torch.cuda.amp.autocast(enabled=mixed_precision_training):
-                model_pred = pose_adaptor(noisy_latents,
-                                          timesteps,
+            # https://arxiv.org/abs/2211.09800
+            with torch.cuda.amp.autocast(enabled=mixed_precision_training, dtype=torch.bfloat16):
+                model_pred = pose_adaptor(input_latents,
+                                          c_noise,
                                           encoder_hidden_states=encoder_hidden_states,
-                                          pose_embedding=plucker_embedding)  # [b c f h w]
-
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    raise NotImplementedError
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                                          added_time_ids=add_time_ids,
+                                          pose_embedding=plucker_embedding)  # [b f c h w]
+                predicted_latents = c_out * model_pred + c_skip * noisy_latents
+                loss = torch.mean(loss_weight * (predicted_latents.float() - latents.float()) ** 2)
 
             # Backpropagate
             if mixed_precision_training:
@@ -434,10 +496,22 @@ def main(name: str,
                 """ <<< gradient clipping <<< """
                 optimizer.step()
 
+            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+            average_loss = loss / dist.get_world_size()
+
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
             iter_end_time = time.time()
+
+            if (global_step % logger_interval) == 0 or global_step == 0:
+                gpu_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                msg = f"Iter: {global_step}/{max_train_steps}, Loss: {average_loss.item(): .4f}, " \
+                      f"lr: {lr_scheduler.get_last_lr()}, Data time: {format_time(data_end_time - iter_start_time)}, " \
+                      f"Iter time: {format_time(iter_end_time - data_end_time)}, " \
+                      f"ETA: {format_time((iter_end_time - iter_start_time) * (max_train_steps - global_step))}, " \
+                      f"GPU memory: {gpu_memory: .2f} G"
+                logger.info(msg)
 
             # Save checkpoint
             if is_main_process and (global_step % checkpointing_steps == 0):
@@ -447,7 +521,7 @@ def main(name: str,
                     "global_step": global_step,
                     "pose_encoder_state_dict": pose_adaptor.module.pose_encoder.state_dict(),
                     "attention_processor_state_dict": {k: v for k, v in unet.state_dict().items()
-                                                       if k in attention_trainable_param_names},
+                                                       if k in unet_trainable_param_names},
                     "optimizer_state_dict": optimizer.state_dict()
                 }
                 torch.save(state_dict, os.path.join(save_path, f"checkpoint-step-{global_step}.ckpt"))
@@ -474,33 +548,37 @@ def main(name: str,
                 validation_data_iter = iter(validation_dataloader)
 
                 for idx, validation_batch in enumerate(validation_data_iter):
+                    # if idx == 11:
+                    #     break
                     plucker_embedding = validation_batch['plucker_embedding'].to(device=unet.device)
-                    plucker_embedding = rearrange(plucker_embedding, "b f c h w -> b c f h w")
+                    if first_image_cond:
+                        conditioning_images = validation_batch['pixel_values'][:, 0].to(local_rank)
+                    else:
+                        conditioning_images = validation_batch['condition_image'][:, 0].to(local_rank)      # [b, c, h, w] -1 - 1
                     sample = validation_pipeline(
-                        prompt=validation_batch['text'],
+                        image=conditioning_images,
                         pose_embedding=plucker_embedding,
-                        video_length=video_length,
                         height=height,
                         width=width,
-                        num_inference_steps=25,
-                        guidance_scale=8.,
+                        num_frames=video_length,
+                        num_inference_steps=num_inference_steps,
+                        min_guidance_scale=min_guidance_scale,
+                        max_guidance_scale=max_guidance_scale,
                         generator=generator,
-                    ).videos[0]  # [3 f h w]
-                    sample_gt = torch.cat([sample, (validation_batch['pixel_values'][0].permute(1, 0, 2, 3) + 1.0) / 2.0], dim=2)  # [3, f, 2h, w]
+                        output_type='pt'
+                    ).frames[0].cpu()  # [f 3 h w] 0-1
+                    sample_gt = rearrange(torch.cat([sample, (validation_batch['pixel_values'][0] + 1) / 2], dim=2), 'f c h w -> c f h w')  # [3, f 2h, w]
                     if 'clip_name' in validation_batch:
-                        save_path = f"{output_dir}/samples/sample-{global_step}/{validation_batch['clip_name'][0]}.gif"
+                        save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}_{validation_batch['clip_name'][0]}.gif"
+                        image_save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}_{validation_batch['clip_name'][0]}.png"
                     else:
-                        save_path = f"{output_dir}/samples/sample-{global_step}/{idx}.gif"
-                    save_videos_grid(sample_gt[None, ...], save_path)
+                        save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}.gif"
+                        image_save_path = f"{output_dir}/samples/sample-{global_step}/{'_'.join(validation_batch['video_caption'][0].split(' ')[:10])}.png"
+                    save_videos_grid(sample_gt[None, ...], save_path, rescale=False)
+                    conditioning_image = conditioning_images[0] / 2. + 0.5  # 3 h w
+                    torchvision.utils.save_image(conditioning_image, image_save_path)
                     logger.info(f"Saved samples to {save_path}")
-            if (global_step % logger_interval) == 0 or global_step == 0:
-                gpu_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                msg = f"Iter: {global_step}/{max_train_steps}, Loss: {loss.detach().item(): .4f}, " \
-                      f"lr: {lr_scheduler.get_last_lr()}, Data time: {format_time(data_end_time - iter_start_time)}, " \
-                      f"Iter time: {format_time(iter_end_time - data_end_time)}, " \
-                      f"ETA: {format_time((iter_end_time - iter_start_time) * (max_train_steps - global_step))}, " \
-                      f"GPU memory: {gpu_memory: .2f} G"
-                logger.info(msg)
+            dist.barrier()
 
             if global_step >= max_train_steps:
                 break

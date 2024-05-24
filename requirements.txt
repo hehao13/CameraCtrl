@@ -1,0 +1,17 @@
+diffusers==0.24.0
+imageio==2.27.0
+xformers==0.0.25
+transformers==4.39.3
+gradio==4.26.0
+imageio==2.27.0
+imageio-ffmpeg==0.4.9
+opencv-python
+gdown
+einops
+decord
+omegaconf
+safetensors
+gradio
+wandb
+triton
+termcolor

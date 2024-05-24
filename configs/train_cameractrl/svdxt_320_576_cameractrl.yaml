@@ -1,0 +1,88 @@
+output_dir: "output/cameractrl_model"
+pretrained_model_path: "[replace with SVD-xt root path]"
+unet_subfolder: "unet"
+down_block_types: ['CrossAttnDownBlockSpatioTemporalPoseCond', 'CrossAttnDownBlockSpatioTemporalPoseCond', 'CrossAttnDownBlockSpatioTemporalPoseCond', 'DownBlockSpatioTemporal']
+up_block_types: ['UpBlockSpatioTemporal', 'CrossAttnUpBlockSpatioTemporalPoseCond', 'CrossAttnUpBlockSpatioTemporalPoseCond', 'CrossAttnUpBlockSpatioTemporalPoseCond']
+
+train_data:
+  root_path:       "[replace RealEstate10K root path]"
+  annotation_json:       "annotations/train.json"
+  sample_stride: 5
+  sample_n_frames: 25
+  relative_pose: true
+  zero_t_first_frame: true
+  sample_size: [320, 576]
+  rescale_fxy: true
+  shuffle_frames: false
+  use_flip: false
+
+validation_data:
+  root_path:       "[replace RealEstate10K root path]"
+  annotation_json:       "annotations/validation.json"
+  sample_stride: 5
+  sample_n_frames: 25
+  relative_pose: true
+  zero_t_first_frame: true
+  sample_size: [320, 576]
+  rescale_fxy: true
+  shuffle_frames: false
+  use_flip: false
+  return_clip_name: true
+
+random_null_image_ratio: 0.15
+
+pose_encoder_kwargs:
+  downscale_factor: 8
+  channels: [320, 640, 1280, 1280]
+  nums_rb: 2
+  cin: 384
+  ksize: 1
+  sk: true
+  use_conv: false
+  compression_factor: 1
+  temporal_attention_nhead: 8
+  attention_block_types: ["Temporal_Self", ]
+  temporal_position_encoding: true
+  temporal_position_encoding_max_len: 25
+
+attention_processor_kwargs:
+  add_spatial: false
+  add_temporal: true
+  attn_processor_name: 'attn1'
+  pose_feature_dimensions: [320, 640, 1280, 1280]
+  query_condition: true
+  key_value_condition: true
+  scale: 1.0
+
+do_sanity_check: false
+sample_before_training: false
+video_length: 25
+
+max_train_epoch:      -1
+max_train_steps:      50000
+validation_steps:       2500
+validation_steps_tuple: [1000, ]
+
+learning_rate:    3.e-5
+
+P_mean: 0.7
+P_std: 1.6
+condition_image_noise_mean: -3.0
+condition_image_noise_std: 0.5
+sample_latent: true
+first_image_cond: true
+
+num_inference_steps: 25
+min_guidance_scale: 1.0
+max_guidance_scale: 3.0
+
+num_workers: 8
+train_batch_size: 1
+checkpointing_epochs: -1
+checkpointing_steps:  10000
+
+mixed_precision_training: false
+enable_xformers_memory_efficient_attention: true
+
+global_seed: 42
+logger_interval: 10

@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import rearrange
+from typing import List, Tuple
 from cameractrl.models.motion_module import TemporalTransformerBlock
 
 
@@ -18,7 +19,7 @@ def get_parameter_dtype(parameter: torch.nn.Module):
     except StopIteration:
         # For torch.nn.DataParallel compatibility in PyTorch 1.5
 
-        def find_tensor_attributes(module: torch.nn.Module) -> List[Tuple[str, Tensor]]:
+        def find_tensor_attributes(module: torch.nn.Module) -> List[Tuple[str, torch.Tensor]]:
             tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
             return tuples
 
@@ -59,16 +60,14 @@ class PoseAdaptor(nn.Module):
         self.unet = unet
         self.pose_encoder = pose_encoder
 
-    def forward(self, noisy_latents, timesteps, encoder_hidden_states, pose_embedding):
+    def forward(self, noisy_latents, c_noise, encoder_hidden_states, added_time_ids, pose_embedding):
         assert pose_embedding.ndim == 5
-        bs = pose_embedding.shape[0]            # b c f h w
-        pose_embedding_features = self.pose_encoder(pose_embedding)      # bf c h w
-        pose_embedding_features = [rearrange(x, '(b f) c h w -> b c f h w', b=bs)
-                                   for x in pose_embedding_features]
+        pose_embedding_features = self.pose_encoder(pose_embedding)      # b c f h w
         noise_pred = self.unet(noisy_latents,
-                               timesteps,
+                               c_noise,
                                encoder_hidden_states,
-                               pose_embedding_features=pose_embedding_features).sample
+                               added_time_ids=added_time_ids,
+                               pose_features=pose_embedding_features).sample
         return noise_pred
 
 
@@ -225,7 +224,7 @@ class CameraPoseEncoder(nn.Module):
     def forward(self, x):
         # unshuffle
         bs = x.shape[0]
-        x = rearrange(x, "b c f h w -> (b f) c h w")
+        x = rearrange(x, "b f c h w -> (b f) c h w")
         x = self.unshuffle(x)
         # extract features
         features = []
@@ -237,5 +236,5 @@ class CameraPoseEncoder(nn.Module):
                 x = rearrange(x, '(b f) c h w -> (b h w) f c', b=bs)
                 x = attention_layer(x)
                 x = rearrange(x, '(b h w) f c -> (b f) c h w', h=h, w=w)
-            features.append(x)
+            features.append(rearrange(x, '(b f) c h w -> b c f h w', b=bs))
         return features

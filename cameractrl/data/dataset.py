@@ -97,7 +97,7 @@ def ray_condition(K, c2w, H, W, device, flip_flag=None):
     rays_o = c2w[..., :3, 3]                                        # B, V, 3
     rays_o = rays_o[:, :, None].expand_as(rays_d)                   # B, V, HW, 3
     # c2w @ dirctions
-    rays_dxo = torch.cross(rays_o, rays_d)                          # B, V, HW, 3
+    rays_dxo = torch.linalg.cross(rays_o, rays_d)                          # B, V, HW, 3
     plucker = torch.cat([rays_dxo, rays_d], dim=-1)
     plucker = plucker.reshape(B, c2w.shape[1], H, W, 6)             # B, V, H, W, 6
     # plucker = plucker.permute(0, 1, 4, 2, 3)
@@ -281,6 +281,10 @@ class RealEstate10KPose(Dataset):
         assert end_frame_ind - start_frame_ind >= self.sample_n_frames
         frame_indices = np.linspace(start_frame_ind, end_frame_ind - 1, self.sample_n_frames, dtype=int)
 
+        condition_image_ind = random.sample(list(set(range(total_frames)) - set(frame_indices.tolist())), 1)
+        condition_image = torch.from_numpy(video_reader.get_batch(condition_image_ind).asnumpy()).permute(0, 3, 1, 2).contiguous()
+        condition_image = condition_image / 255.
+
         if self.shuffle_frames:
             perm = np.random.permutation(self.sample_n_frames)
             frame_indices = frame_indices[perm]
@@ -318,7 +322,7 @@ class RealEstate10KPose(Dataset):
         plucker_embedding = ray_condition(intrinsics, c2w, self.sample_size[0], self.sample_size[1], device='cpu',
                                           flip_flag=flip_flag)[0].permute(0, 3, 1, 2).contiguous()
 
-        return pixel_values, video_caption, plucker_embedding, flip_flag, clip_name
+        return pixel_values, condition_image, plucker_embedding, video_caption, flip_flag, clip_name
 
     def __len__(self):
         return self.length
@@ -326,7 +330,7 @@ class RealEstate10KPose(Dataset):
     def __getitem__(self, idx):
         while True:
             try:
-                video, video_caption, plucker_embedding, flip_flag, clip_name = self.get_batch(idx)
+                video, condition_image, plucker_embedding, video_caption, flip_flag, clip_name = self.get_batch(idx)
                 break
 
             except Exception as e:
@@ -335,14 +339,17 @@ class RealEstate10KPose(Dataset):
         if self.use_flip:
             video = self.pixel_transforms[0](video)
             video = self.pixel_transforms[1](video, flip_flag)
-            video = self.pixel_transforms[2](video)
+            for transform in self.pixel_transforms[2:]:
+                video = transform(video)
         else:
             for transform in self.pixel_transforms:
                 video = transform(video)
+        for transform in self.pixel_transforms:
+            condition_image = transform(condition_image)
         if self.return_clip_name:
-            sample = dict(pixel_values=video, text=video_caption, plucker_embedding=plucker_embedding, clip_name=clip_name)
+            sample = dict(pixel_values=video, condition_image=condition_image, plucker_embedding=plucker_embedding, video_caption=video_caption, clip_name=clip_name)
         else:
-            sample = dict(pixel_values=video, text=video_caption, plucker_embedding=plucker_embedding)
+            sample = dict(pixel_values=video, condition_image=condition_image, plucker_embedding=plucker_embedding, video_caption=video_caption)
 
         return sample
 

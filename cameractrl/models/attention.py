@@ -1,136 +1,65 @@
-# Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention.py
-
-from dataclasses import dataclass
-from typing import Optional
-
 import torch
-from torch import nn
-
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.utils import BaseOutput
-from diffusers.models.attention import BasicTransformerBlock
-from einops import rearrange, repeat
+from typing import Optional
+from diffusers.models.attention import TemporalBasicTransformerBlock, _chunked_feed_forward
+from diffusers.utils.torch_utils import maybe_allow_in_graph
 
 
-@dataclass
-class Transformer3DModelOutput(BaseOutput):
-    sample: torch.FloatTensor
+@maybe_allow_in_graph
+class TemporalPoseCondTransformerBlock(TemporalBasicTransformerBlock):
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,   # [bs * num_frame, h * w, c]
+        num_frames: int,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,  # [bs * h * w, 1, c]
+        pose_feature: Optional[torch.FloatTensor] = None,       # [bs, c, n_frame, h, w]
+    ) -> torch.FloatTensor:
+        # Notice that normalization is always applied before the real computation in the following blocks.
+        # 0. Self-Attention
 
+        batch_frames, seq_length, channels = hidden_states.shape
+        batch_size = batch_frames // num_frames
 
-class Transformer3DModel(ModelMixin, ConfigMixin):
-    @register_to_config
-    def __init__(
-            self,
-            num_attention_heads: int = 16,
-            attention_head_dim: int = 88,
-            in_channels: Optional[int] = None,
-            num_layers: int = 1,
-            dropout: float = 0.0,
-            norm_num_groups: int = 32,
-            cross_attention_dim: Optional[int] = None,
-            attention_bias: bool = False,
-            activation_fn: str = "geglu",
-            num_embeds_ada_norm: Optional[int] = None,
-            use_linear_projection: bool = False,
-            only_cross_attention: bool = False,
-            upcast_attention: bool = False,
-            norm_type: str = "layer_norm",
-            norm_elementwise_affine: bool = True,
-    ):
-        super().__init__()
-        self.use_linear_projection = use_linear_projection
-        self.num_attention_heads = num_attention_heads
-        self.attention_head_dim = attention_head_dim
-        inner_dim = num_attention_heads * attention_head_dim
+        hidden_states = hidden_states[None, :].reshape(batch_size, num_frames, seq_length, channels)
+        hidden_states = hidden_states.permute(0, 2, 1, 3)
+        hidden_states = hidden_states.reshape(batch_size * seq_length, num_frames, channels)  # [bs * h * w, frame, c]
 
-        # Define input layers
-        self.in_channels = in_channels
-
-        self.norm = torch.nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6, affine=True)
-        if use_linear_projection:
-            self.proj_in = nn.Linear(in_channels, inner_dim)
-        else:
-            self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
-
-        # Define transformers blocks
-        self.transformer_blocks = nn.ModuleList(
-            [
-                BasicTransformerBlock(
-                    inner_dim,
-                    num_attention_heads,
-                    attention_head_dim,
-                    dropout=dropout,
-                    cross_attention_dim=cross_attention_dim,
-                    activation_fn=activation_fn,
-                    num_embeds_ada_norm=num_embeds_ada_norm,
-                    attention_bias=attention_bias,
-                    only_cross_attention=only_cross_attention,
-                    upcast_attention=upcast_attention,
-                    norm_type=norm_type,
-                    norm_elementwise_affine=norm_elementwise_affine,
-                )
-                for d in range(num_layers)
-            ]
-        )
-
-        # 4. Define output layers
-        if use_linear_projection:
-            self.proj_out = nn.Linear(in_channels, inner_dim)
-        else:
-            self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
-
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True):
-        # Input
-        assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
-        batch_size, _, video_length = hidden_states.shape[:3]
-        hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
-
-        if encoder_hidden_states.shape[0] == batch_size:
-            encoder_hidden_states = repeat(encoder_hidden_states, 'b n c -> (b f) n c', f=video_length)
-
-        elif encoder_hidden_states.shape[0] == batch_size * video_length:
-            pass
-        else:
-            raise ValueError
-
-        batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
+        hidden_states = self.norm_in(hidden_states)
 
-        hidden_states = self.norm(hidden_states)
-        if not self.use_linear_projection:
-            hidden_states = self.proj_in(hidden_states)
-            inner_dim = hidden_states.shape[1]
-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * weight, inner_dim)
+        if self._chunk_size is not None:
+            hidden_states = _chunked_feed_forward(self.ff_in, hidden_states, self._chunk_dim, self._chunk_size)
         else:
-            inner_dim = hidden_states.shape[1]
-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * weight, inner_dim)
-            hidden_states = self.proj_in(hidden_states)
+            hidden_states = self.ff_in(hidden_states)
 
-        # Blocks
-        for block in self.transformer_blocks:
-            hidden_states = block(
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                timestep=timestep,
-            )
+        if self.is_res:
+            hidden_states = hidden_states + residual
 
-        # Output
-        if not self.use_linear_projection:
-            hidden_states = (
-                hidden_states.reshape(batch, height, weight, inner_dim).permute(0, 3, 1, 2).contiguous()
-            )
-            hidden_states = self.proj_out(hidden_states)
+        norm_hidden_states = self.norm1(hidden_states)
+        pose_feature = pose_feature.permute(0, 3, 4, 2, 1).reshape(batch_size * seq_length, num_frames, -1)
+        attn_output = self.attn1(norm_hidden_states, encoder_hidden_states=None, pose_feature=pose_feature)
+        hidden_states = attn_output + hidden_states
+
+        # 3. Cross-Attention
+        if self.attn2 is not None:
+            norm_hidden_states = self.norm2(hidden_states)
+            attn_output = self.attn2(norm_hidden_states, encoder_hidden_states=encoder_hidden_states, pose_feature=pose_feature)
+            hidden_states = attn_output + hidden_states
+
+        # 4. Feed-forward
+        norm_hidden_states = self.norm3(hidden_states)
+
+        if self._chunk_size is not None:
+            ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
         else:
-            hidden_states = self.proj_out(hidden_states)
-            hidden_states = (
-                hidden_states.reshape(batch, height, weight, inner_dim).permute(0, 3, 1, 2).contiguous()
-            )
+            ff_output = self.ff(norm_hidden_states)
 
-        output = hidden_states + residual
+        if self.is_res:
+            hidden_states = ff_output + hidden_states
+        else:
+            hidden_states = ff_output
 
-        output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
-        if not return_dict:
-            return (output,)
+        hidden_states = hidden_states[None, :].reshape(batch_size, seq_length, num_frames, channels)
+        hidden_states = hidden_states.permute(0, 2, 1, 3)
+        hidden_states = hidden_states.reshape(batch_size * num_frames, seq_length, channels)
 
-        return Transformer3DModelOutput(sample=output)
+        return hidden_states

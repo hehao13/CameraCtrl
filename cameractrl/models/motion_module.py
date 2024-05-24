@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from diffusers.utils import BaseOutput
@@ -10,12 +9,23 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models.attention import FeedForward
 
 from typing import Dict, Any
-from cameractrl.models.resnet import InflatedGroupNorm
 from cameractrl.models.attention_processor import PoseAdaptorAttnProcessor
 
 from einops import rearrange
 import math
 
+
+class InflatedGroupNorm(nn.GroupNorm):
+    def forward(self, x):
+        # return super().forward(x)
+
+        video_length = x.shape[2]
+
+        x = rearrange(x, "b c f h w -> (b f) c h w")
+        x = super().forward(x)
+        x = rearrange(x, "(b f) c h w -> b c f h w", f=video_length)
+
+        return x
 
 def zero_module(module):
     # Zero out the parameters of a module and return it.
