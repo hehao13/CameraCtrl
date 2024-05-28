@@ -87,7 +87,7 @@ python -m torch.distributed.launch --nproc_per_node=8 --master_port=25000 infere
 
 where
 
-- `OUTPUT_PATH` refers to the path to save resules.
+- `OUTPUT_PATH` refers to the path to save results.
 - `SD1.5_PATH` refers to the root path of the downloaded SD1.5 model.
 - `SUBFOUDER_NAME` refers to the subfolder name of unet in the `SD1.5_PATH`, default is `unet`. Here we adopt the name specified by `tools/merge_lora2unet.py`.
 - `ADV3_MM_CKPT` refers to the path of the downloaded AnimateDiffV3 motion module checkpoint.
